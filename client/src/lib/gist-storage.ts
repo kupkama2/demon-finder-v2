@@ -1,137 +1,245 @@
-export interface Demon {
-  id: string;
-  name: string;
-  description: string;
-  cost: number;
-  color: string;
-  prestige: number;
-  createdAt: string;
-}
+const TOKEN_KEY = "demon-finder-gh-token";
+const GIST_ID_KEY = "demon-finder-gist-id";
+const DATA_FILENAME = "demon-finder-data.json";
+const LOCAL_CACHE_KEY = "demon-finder-cache";
 
-export interface LogEntry {
-  id: string;
-  demonId: string;
-  timestamp: string;
-  note: string;
-  cost: number;
-}
+export interface Demon { id: number; name: string; sortOrder: number; }
+export interface LogEntry { id: number; demonId: number; cost: number; timestamp: string; }
 
-export interface KillPlan {
-  id: string;
-  demonId: string;
-  strategy: string;
-  targetDate: string;
-  completed: boolean;
-  createdAt: string;
-}
+export type TpQuality = "perfect" | "too-early" | "too-late";
+export type SlQuality = "perfect" | "too-wide" | "too-narrow";
+export interface TradeGrade { id: number; tp: TpQuality | null; sl: SlQuality | null; timestamp: string; }
 
-export interface TradeGrade {
-  id: string;
-  date: string;
-  grade: string;
-  notes: string;
-  pnl: number;
-}
+export interface KillPlan { demonId: number; note: string; createdAt: string; }
 
-export interface DailyTrade {
-  id: string;
-  date: string;
-  contracts: number;
-  winRate: number;
-  pnl: number;
-  notes: string;
-}
+export type TradeResult = "win" | "loss";
+export interface DailyTrade { id: number; result: TradeResult; pnl: number; timestamp: string; }
 
+// Weekly review: combat plans for top 3 worst demons
+export interface WeeklyCombatPlan {
+  demonId: number;
+  plan: string; // how you'll combat this demon
+}
 export interface WeeklyReview {
-  id: string;
-  weekStart: string;
-  weekEnd: string;
-  notes: string;
-  topDemon: string;
-  improvement: string;
-  createdAt: string;
+  weekStart: string; // ISO date string (Monday), e.g. "2026-03-16"
+  completedAt: string; // when the user submitted the plans
+  top3: { demonId: number; hits: number; cost: number; score: number }[];
+  combatPlans: WeeklyCombatPlan[];
 }
 
-export interface AppData {
-  demons: Demon[];
-  logs: LogEntry[];
+export interface StoredData {
+  demons: Demon[]; logs: LogEntry[];
+  tradeGrades: TradeGrade[]; nextGradeId: number;
   killPlans: KillPlan[];
-  tradeGrades: TradeGrade[];
-  dailyTrades: DailyTrade[];
+  dailyTrades: DailyTrade[]; nextDailyTradeId: number;
   weeklyReviews: WeeklyReview[];
-  lastUpdated: string;
+  nextDemonId: number; nextLogId: number; lastModified: string;
 }
 
-const LOCAL_KEY = 'demon_finder_data';
-const GIST_TOKEN_KEY = 'gist_token';
-const GIST_ID_KEY = 'gist_id';
+const DEFAULT_DEMONS: Demon[] = [
+  { id: 1, name: "Poor Risk/Reward Trade", sortOrder: 0 },
+  { id: 2, name: "Entered Too Soon", sortOrder: 1 },
+  { id: 3, name: "Entered Too Late", sortOrder: 2 },
+  { id: 4, name: "Exited Too Soon", sortOrder: 3 },
+  { id: 5, name: "Exited Too Late", sortOrder: 4 },
+  { id: 6, name: "Trade Not In Trading Plan", sortOrder: 5 },
+  { id: 7, name: "Incorrect Stop Placement", sortOrder: 6 },
+  { id: 8, name: "Wrong Position Size", sortOrder: 7 },
+  { id: 9, name: "Didn't Take Planned Trade", sortOrder: 8 },
+];
 
-export function getGistToken(): string | null {
-  return localStorage.getItem(GIST_TOKEN_KEY);
+function defaultData(): StoredData {
+  return { demons: [...DEFAULT_DEMONS], logs: [], tradeGrades: [], nextGradeId: 1, killPlans: [], dailyTrades: [], nextDailyTradeId: 1, weeklyReviews: [], nextDemonId: 10, nextLogId: 1, lastModified: new Date().toISOString() };
 }
 
-export function setGistToken(token: string) {
-  localStorage.setItem(GIST_TOKEN_KEY, token);
+// Migration: ensure new fields exist on old caches
+function migrateData(d: StoredData): StoredData {
+  if (!d.tradeGrades) { d.tradeGrades = []; d.nextGradeId = 1; }
+  if (!d.killPlans) { d.killPlans = []; }
+  if (!d.dailyTrades) { d.dailyTrades = []; d.nextDailyTradeId = 1; }
+  if (!d.weeklyReviews) { d.weeklyReviews = []; }
+  return d;
 }
 
-export function getGistId(): string | null {
-  return localStorage.getItem(GIST_ID_KEY);
+export function getToken(): string | null { return localStorage.getItem(TOKEN_KEY); }
+export function setToken(t: string): void { localStorage.setItem(TOKEN_KEY, t); }
+export function clearToken(): void { localStorage.removeItem(TOKEN_KEY); localStorage.removeItem(GIST_ID_KEY); }
+
+function getGistId(): string | null { return localStorage.getItem(GIST_ID_KEY); }
+function setGistId(id: string): void { localStorage.setItem(GIST_ID_KEY, id); }
+
+export function getLocalCache(): StoredData {
+  try { const r = localStorage.getItem(LOCAL_CACHE_KEY); if (r) return migrateData(JSON.parse(r)); } catch {}
+  return defaultData();
+}
+function setLocalCache(d: StoredData): void { localStorage.setItem(LOCAL_CACHE_KEY, JSON.stringify(d)); }
+
+async function gistReq(method: string, path: string, body?: unknown): Promise<Response> {
+  const token = getToken();
+  if (!token) throw new Error("No token");
+  return fetch(`https://api.github.com${path}`, {
+    method,
+    headers: { Authorization: `token ${token}`, Accept: "application/vnd.github.v3+json", ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
 }
 
-export function setGistId(id: string) {
-  localStorage.setItem(GIST_ID_KEY, id);
+async function findGist(): Promise<string | null> {
+  const cached = getGistId();
+  if (cached) { const r = await gistReq("GET", `/gists/${cached}`); if (r.ok) return cached; localStorage.removeItem(GIST_ID_KEY); }
+  const r = await gistReq("GET", "/gists?per_page=100");
+  if (!r.ok) return null;
+  const gists = await r.json();
+  for (const g of gists) { if (g.files?.[DATA_FILENAME]) { setGistId(g.id); return g.id; } }
+  return null;
 }
 
-export function loadLocalData(): AppData {
+export async function loadFromGist(): Promise<StoredData> {
+  if (!getToken()) return getLocalCache();
   try {
-    const raw = localStorage.getItem(LOCAL_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch {}
-  return {
-    demons: [],
-    logs: [],
-    killPlans: [],
-    tradeGrades: [],
-    dailyTrades: [],
-    weeklyReviews: [],
-    lastUpdated: new Date().toISOString(),
-  };
+    const gistId = await findGist();
+    if (!gistId) return getLocalCache();
+    const r = await gistReq("GET", `/gists/${gistId}`);
+    if (!r.ok) return getLocalCache();
+    const g = await r.json();
+    const content = g.files?.[DATA_FILENAME]?.content;
+    if (!content) return getLocalCache();
+    const data: StoredData = JSON.parse(content);
+    setLocalCache(data);
+    return data;
+  } catch { return getLocalCache(); }
 }
 
-export function saveLocalData(data: AppData) {
+export async function saveToGist(data: StoredData): Promise<void> {
+  data.lastModified = new Date().toISOString();
+  setLocalCache(data);
+  if (!getToken()) return;
   try {
-    localStorage.setItem(LOCAL_KEY, JSON.stringify({ ...data, lastUpdated: new Date().toISOString() }));
-  } catch {}
+    let gistId = await findGist();
+    const payload = { files: { [DATA_FILENAME]: { content: JSON.stringify(data, null, 2) } } };
+    if (!gistId) {
+      const r = await gistReq("POST", "/gists", { description: "Demon Finder Data", public: false, ...payload });
+      if (r.ok) { const g = await r.json(); setGistId(g.id); }
+    } else {
+      await gistReq("PATCH", `/gists/${gistId}`, payload);
+    }
+  } catch { console.warn("Gist sync failed, saved locally"); }
 }
 
-export async function syncFromGist(): Promise<AppData | null> {
-  const token = getGistToken();
-  const gistId = getGistId();
-  if (!token || !gistId) return null;
-  try {
-    const res = await fetch(`https://api.github.com/gists/${gistId}`, {
-      headers: { Authorization: `token ${token}`, Accept: 'application/vnd.github.v3+json' },
-    });
-    if (!res.ok) return null;
-    const gist = await res.json();
-    const file = gist.files['demon-finder-data.json'];
-    if (!file) return null;
-    return JSON.parse(file.content) as AppData;
-  } catch { return null; }
+let pending: ReturnType<typeof setTimeout> | null = null;
+function debouncedSave(data: StoredData): void {
+  setLocalCache(data);
+  if (pending) clearTimeout(pending);
+  pending = setTimeout(() => { saveToGist(data); pending = null; }, 1000);
 }
 
-export async function syncToGist(data: AppData): Promise<boolean> {
-  const token = getGistToken();
-  const gistId = getGistId();
-  if (!token || !gistId) return false;
+export function getDemons(): Demon[] { return getLocalCache().demons.sort((a, b) => a.sortOrder - b.sortOrder); }
+export function getLogs(): LogEntry[] { return getLocalCache().logs.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()); }
+
+export function createDemon(name: string): Demon {
+  const d = getLocalCache(); const demon: Demon = { id: d.nextDemonId++, name, sortOrder: d.demons.length };
+  d.demons.push(demon); debouncedSave(d); return demon;
+}
+export function updateDemon(id: number, name: string): Demon | null {
+  const d = getLocalCache(); const demon = d.demons.find((x) => x.id === id);
+  if (!demon) return null; demon.name = name; debouncedSave(d); return demon;
+}
+export function deleteDemon(id: number): boolean {
+  const d = getLocalCache(); const i = d.demons.findIndex((x) => x.id === id);
+  if (i === -1) return false; d.demons.splice(i, 1); debouncedSave(d); return true;
+}
+export function reorderDemons(orderedIds: number[]): void {
+  const d = getLocalCache();
+  orderedIds.forEach((id, idx) => {
+    const demon = d.demons.find((x) => x.id === id);
+    if (demon) demon.sortOrder = idx;
+  });
+  debouncedSave(d);
+}
+export function createLog(demonId: number, cost: number): LogEntry {
+  const d = getLocalCache(); const e: LogEntry = { id: d.nextLogId++, demonId, cost, timestamp: new Date().toISOString() };
+  d.logs.push(e); debouncedSave(d); return e;
+}
+export function deleteLog(id: number): boolean {
+  const d = getLocalCache(); const i = d.logs.findIndex((x) => x.id === id);
+  if (i === -1) return false; d.logs.splice(i, 1); debouncedSave(d); return true;
+}
+export function clearAllLogs(): void { const d = getLocalCache(); d.logs = []; d.nextLogId = 1; debouncedSave(d); }
+
+// === Trade Grades ===
+export function getTradeGrades(): TradeGrade[] { return getLocalCache().tradeGrades.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()); }
+export function createTradeGrade(tp: TpQuality | null, sl: SlQuality | null): TradeGrade {
+  const d = getLocalCache(); const g: TradeGrade = { id: d.nextGradeId++, tp, sl, timestamp: new Date().toISOString() };
+  d.tradeGrades.push(g); debouncedSave(d); return g;
+}
+export function deleteTradeGrade(id: number): boolean {
+  const d = getLocalCache(); const i = d.tradeGrades.findIndex((x) => x.id === id);
+  if (i === -1) return false; d.tradeGrades.splice(i, 1); debouncedSave(d); return true;
+}
+export function clearAllTradeGrades(): void { const d = getLocalCache(); d.tradeGrades = []; d.nextGradeId = 1; debouncedSave(d); }
+
+// === Kill Plans ===
+export function getKillPlan(demonId: number): KillPlan | undefined {
+  return getLocalCache().killPlans.find((k) => k.demonId === demonId);
+}
+export function setKillPlan(demonId: number, note: string): KillPlan {
+  const d = getLocalCache();
+  const existing = d.killPlans.findIndex((k) => k.demonId === demonId);
+  const plan: KillPlan = { demonId, note, createdAt: new Date().toISOString() };
+  if (existing >= 0) { d.killPlans[existing] = plan; } else { d.killPlans.push(plan); }
+  debouncedSave(d); return plan;
+}
+export function deleteKillPlan(demonId: number): boolean {
+  const d = getLocalCache(); const i = d.killPlans.findIndex((k) => k.demonId === demonId);
+  if (i === -1) return false; d.killPlans.splice(i, 1); debouncedSave(d); return true;
+}
+
+// === Daily Trades ===
+export function getDailyTrades(): DailyTrade[] { return getLocalCache().dailyTrades.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()); }
+export function createDailyTrade(result: TradeResult, pnl: number): DailyTrade {
+  const d = getLocalCache(); const t: DailyTrade = { id: d.nextDailyTradeId++, result, pnl, timestamp: new Date().toISOString() };
+  d.dailyTrades.push(t); debouncedSave(d); return t;
+}
+export function deleteDailyTrade(id: number): boolean {
+  const d = getLocalCache(); const i = d.dailyTrades.findIndex((x) => x.id === id);
+  if (i === -1) return false; d.dailyTrades.splice(i, 1); debouncedSave(d); return true;
+}
+export function clearTodayDailyTrades(): void {
+  const d = getLocalCache();
+  const today = new Date().toISOString().slice(0, 10);
+  d.dailyTrades = d.dailyTrades.filter((t) => t.timestamp.slice(0, 10) !== today);
+  debouncedSave(d);
+}
+
+// === Weekly Reviews ===
+export function getWeeklyReviews(): WeeklyReview[] { return getLocalCache().weeklyReviews; }
+export function getWeeklyReview(weekStart: string): WeeklyReview | undefined {
+  return getLocalCache().weeklyReviews.find((r) => r.weekStart === weekStart);
+}
+export function saveWeeklyReview(review: WeeklyReview): void {
+  const d = getLocalCache();
+  const idx = d.weeklyReviews.findIndex((r) => r.weekStart === review.weekStart);
+  if (idx >= 0) { d.weeklyReviews[idx] = review; } else { d.weeklyReviews.push(review); }
+  debouncedSave(d);
+}
+
+export function exportDataJSON(): string {
+  const d = getLocalCache();
+  return JSON.stringify({ demons: d.demons, logs: d.logs, tradeGrades: d.tradeGrades, killPlans: d.killPlans, dailyTrades: d.dailyTrades, weeklyReviews: d.weeklyReviews, exportedAt: new Date().toISOString() }, null, 2);
+}
+export function importDataJSON(jsonStr: string): boolean {
   try {
-    const res = await fetch(`https://api.github.com/gists/${gistId}`, {
-      method: 'PATCH',
-      headers: { Authorization: `token ${token}`, Accept: 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        files: { 'demon-finder-data.json': { content: JSON.stringify({ ...data, lastUpdated: new Date().toISOString() }) } },
-      }),
-    });
-    return res.ok;
+    const imp = JSON.parse(jsonStr); const d = getLocalCache();
+    if (imp.demons?.length) for (const x of imp.demons) { if (!d.demons.find((e: Demon) => e.name === x.name)) d.demons.push({ id: d.nextDemonId++, name: x.name, sortOrder: x.sortOrder ?? d.demons.length }); }
+    if (imp.logs?.length) for (const x of imp.logs) { d.logs.push({ id: d.nextLogId++, demonId: x.demonId, cost: x.cost ?? 0, timestamp: x.timestamp }); }
+    if (imp.tradeGrades?.length) for (const x of imp.tradeGrades) { d.tradeGrades.push({ id: d.nextGradeId++, tp: x.tp, sl: x.sl, timestamp: x.timestamp }); }
+    if (imp.killPlans?.length) for (const x of imp.killPlans) { if (!d.killPlans.find((k: KillPlan) => k.demonId === x.demonId)) d.killPlans.push({ demonId: x.demonId, note: x.note, createdAt: x.createdAt }); }
+    if (imp.dailyTrades?.length) for (const x of imp.dailyTrades) { d.dailyTrades.push({ id: d.nextDailyTradeId++, result: x.result, pnl: x.pnl, timestamp: x.timestamp }); }
+    if (imp.weeklyReviews?.length) for (const x of imp.weeklyReviews) { if (!d.weeklyReviews.find((r: WeeklyReview) => r.weekStart === x.weekStart)) d.weeklyReviews.push(x); }
+    debouncedSave(d); return true;
   } catch { return false; }
+}
+
+export async function validateToken(token: string): Promise<boolean> {
+  try { const r = await fetch("https://api.github.com/user", { headers: { Authorization: `token ${token}` } }); return r.ok; } catch { return false; }
 }
